@@ -52,6 +52,7 @@ def cml_tts(root_path, meta_file, ignored_speakers=None):
     return items
 
 
+
 def coqui(root_path, meta_file, ignored_speakers=None):
     """Interal dataset formatter."""
     filepath = os.path.join(root_path, meta_file)
@@ -69,6 +70,9 @@ def coqui(root_path, meta_file, ignored_speakers=None):
     emotion_name = None if "emotion_name" in metadata.columns else "neutral"
     items = []
     not_found_counter = 0
+    emb_dir = os.path.join(root_path, "embs")
+    clip_emb_dir = os.path.join(root_path, "clip_embs")
+    f0_dir = os.path.join(root_path, "f0_seq")
     for row in metadata.itertuples():
         if speaker_name is None and ignored_speakers is not None and row.speaker_name in ignored_speakers:
             continue
@@ -76,6 +80,17 @@ def coqui(root_path, meta_file, ignored_speakers=None):
         if not os.path.exists(audio_path):
             not_found_counter += 1
             continue
+        base = os.path.splitext(os.path.basename(row.audio_file))[0]
+        emb_path = os.path.join(emb_dir, f"{base}.npy")
+        clip_emb_path = os.path.join(clip_emb_dir, f"{base}.npy")
+        f0_path = os.path.join(f0_dir, f"{base}.npy")
+        if not os.path.isfile(emb_path):
+            raise FileNotFoundError(f"Embedding not found: {emb_path}")
+        if not os.path.isfile(clip_emb_path):
+            raise FileNotFoundError(f"Embedding not found: {clip_emb_path}")
+        image_emb = np.load(emb_path)  # (512,)
+        clip_emb = np.load(clip_emb_path)
+        f0_emb = np.load(f0_path)
         items.append(
             {
                 "text": row.text,
@@ -83,12 +98,17 @@ def coqui(root_path, meta_file, ignored_speakers=None):
                 "speaker_name": speaker_name if speaker_name is not None else row.speaker_name,
                 "emotion_name": emotion_name if emotion_name is not None else row.emotion_name,
                 "dialect_id": int(row.dialect_id),
+                "image_emb": image_emb,
+                "clip_emb": clip_emb,
+                "f0_emb": f0_emb,
                 "root_path": root_path,
             }
         )
     if not_found_counter > 0:
         print(f" | > [!] {not_found_counter} files not found")
     return items
+
+
 
 
 def tweb(root_path, meta_file, **kwargs):  # pylint: disable=unused-argument
