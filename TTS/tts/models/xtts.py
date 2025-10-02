@@ -1,14 +1,20 @@
 import os
 from dataclasses import dataclass
-
+import math
 import librosa
 import torch
 import torch.nn.functional as F
 import torchaudio
 from coqpit import Coqpit
 import torch.nn as nn
+import insightface
+import cv2
+import numpy as np
+from typing import Tuple, Union, List
+
 
 from TTS.tts.layers.xtts.gpt import GPT
+from TTS.tts.layers.xtts.dialect_pitch import DialectPitchPredictor, PitchEmbedding
 from TTS.tts.layers.xtts.hifigan_decoder import HifiDecoder
 from TTS.tts.layers.xtts.stream_generator import init_stream_support
 from TTS.tts.layers.xtts.tokenizer import VoiceBpeTokenizer, split_sentence
@@ -18,6 +24,57 @@ from TTS.utils.io import load_fsspec
 
 init_stream_support()
 
+class PrecomputedImageEncoder(nn.Module):
+    """
+    이미지 경로 혹은 전처리된 Tensor를 받아
+    (512,) 혹은 (B,512) 형태의 embedding을 로드/입력 후
+    xtts_embedding_dim 차원으로 projection.
+    """
+
+    def __init__(
+        self,
+        emb_dir: str,
+        xtts_embedding_dim: int = 1024,
+        device: str = None,
+    ):
+        super().__init__()
+        self.emb_dir = emb_dir
+        self.projection = nn.Linear(512, xtts_embedding_dim)
+
+    def forward(self, image_input: Union[str, List[str], torch.Tensor]) -> torch.Tensor:
+        device = next(self.projection.parameters()).device
+
+        if torch.is_tensor(image_input):
+            emb = image_input.to(device)
+            # (512,) → (1,512)
+            if emb.dim() == 1:
+                emb = emb.unsqueeze(0)
+            return self.projection(emb)
+
+        paths = image_input if isinstance(image_input, (list, tuple)) else [image_input]
+        out_list = []
+        for p in paths:
+            base = os.path.splitext(os.path.basename(p))[0]
+            npy_path = os.path.join(self.emb_dir, f"{base}.npy")
+            if not os.path.isfile(npy_path):
+                raise FileNotFoundError(f"Embedding not found: {npy_path}")
+            emb_np = np.load(npy_path)               
+            emb = torch.from_numpy(emb_np).unsqueeze(0).to(device)
+            out_list.append(self.projection(emb))       
+
+        return torch.cat(out_list, dim=0)
+class FusionMLP(nn.Module):
+    def __init__(self, in_dim=1024, out_dim=512, hidden_dim=1024):
+        super().__init__()
+        self.fusion = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, out_dim)
+        )
+    def forward(self, arc_emb, clip_emb):
+        x = torch.cat([arc_emb, clip_emb], dim=-1)
+        return F.normalize(self.fusion(x), dim=-1)
 
 def wav_to_mel_cloning(
     wav,
@@ -211,6 +268,18 @@ class Xtts(BaseTTS):
         self.models_dir = config.model_dir
         self.gpt_batch_size = self.args.gpt_batch_size
         self.dialect_embedding = nn.Embedding(6, config['model_args']['gpt_n_model_channels'])
+        self.dialect_pitch_predictor = DialectPitchPredictor(
+            dialect_emb_module=self.dialect_embedding,
+            hidden_dim=config['model_args']['gpt_n_model_channels'],
+        )
+        self.pitch_embedding = PitchEmbedding(
+            num_bins=256,
+            embed_dim=config['model_args']['gpt_n_model_channels'],
+            f0_min=0,
+            f0_max= 382,
+        )
+        self.film_gamma = nn.Linear(config['model_args']['gpt_n_model_channels'], config['model_args']['gpt_n_model_channels'])
+        self.film_beta  = nn.Linear(config['model_args']['gpt_n_model_channels'], config['model_args']['gpt_n_model_channels'])
         self.tokenizer = VoiceBpeTokenizer()
         self.gpt = None
         self.init_models()
@@ -218,6 +287,9 @@ class Xtts(BaseTTS):
 
     def init_models(self):
         """Initialize the models. We do it here since we need to load the tokenizer first."""
+        d_vec_dim = int(getattr(self.args, "d_vector_dim", 256))
+        secs_dim  = int(getattr(self.args, "secs_dim", d_vec_dim))
+        freeze_fusion = bool(getattr(self.args, "freeze_fusion", True))
         if self.tokenizer.tokenizer is not None:
             self.args.gpt_number_text_tokens = self.tokenizer.get_number_tokens()
             self.args.gpt_start_text_token = self.tokenizer.tokenizer.token_to_id("[START]")
@@ -250,9 +322,55 @@ class Xtts(BaseTTS):
             d_vector_dim=self.args.d_vector_dim,
             cond_d_vector_in_each_upsampling_layer=self.args.cond_d_vector_in_each_upsampling_layer,
         )
-        # self.dialect_embedding = nn.Embedding(6, self.config['model_args']['gpt_n_model_channels'])
-        
+        self.dialect_embedding = nn.Embedding(6, self.config['model_args']['gpt_n_model_channels'])
+        self.arcface_encoder = PrecomputedImageEncoder(
+            emb_dir="/root/datasets/data_22050/embs",
+            xtts_embedding_dim=512,
+        ).to(self.device)
 
+        self.clip_encoder = PrecomputedImageEncoder(
+            emb_dir="/root/datasets/data_22050/clip_embs",
+            xtts_embedding_dim=512,
+        ).to(self.device)
+
+        self.image_spkr_proj = nn.Linear(512, d_vec_dim).to(self.device)
+
+        self.concat_fusion = FusionMLP(in_dim=1024, out_dim=512, hidden_dim=1024).to(self.device)
+        ckpt = torch.load("/root/workspace/best_fusion_model.pth", map_location=self.device)
+        fusion_state = ckpt["state_dict"] if (isinstance(ckpt, dict) and "state_dict" in ckpt) else ckpt
+        self.concat_fusion.load_state_dict(fusion_state, strict=True)
+        if freeze_fusion:
+            for p in self.concat_fusion.parameters():
+                p.requires_grad = False
+            self.concat_fusion.eval()
+
+        self.clip_proj = nn.Linear(512, 80).to(self.device)
+        self.style_adapter = nn.Sequential(
+            nn.Linear(80, 256),
+            nn.ReLU(),
+            nn.Linear(256, 80)
+        ).to(self.device)
+
+        self.image_spkr_head = nn.Sequential(
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Linear(512, d_vec_dim)
+        )
+        self.image_spkr_head[-1] = nn.utils.weight_norm(self.image_spkr_head[-1])
+        self.image_spkr_head = self.image_spkr_head.to(self.device)
+
+        self.secs_dim = secs_dim
+        self.secs_align = nn.Linear(d_vec_dim, secs_dim, bias=False).to(self.device)
+        nn.init.orthogonal_(self.secs_align.weight)
+        self.style_stopgrad_from_arc = bool(getattr(self.args, "style_stopgrad_from_arc", False))
+        self.spk_feat_drop_p         = float(getattr(self.args, "spk_feat_drop_p", 0.0))
+        self.style_mel_norm          = bool(getattr(self.args, "style_mel_norm", True))
+        self.style_time_jitter_std   = float(getattr(self.args, "style_time_jitter_std", 0.0))
+        self.spk_to_logf0 = nn.Sequential(
+            nn.Linear(d_vec_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
     @property
     def device(self):
         return next(self.parameters()).device
@@ -328,7 +446,8 @@ class Xtts(BaseTTS):
     @torch.inference_mode()
     def get_conditioning_latents(
         self,
-        audio_path,
+        audio_path=None,
+        audio_tensor=None,
         max_ref_length=30,
         gpt_cond_len=6,
         gpt_cond_chunk_len=6,
@@ -336,18 +455,33 @@ class Xtts(BaseTTS):
         sound_norm_refs=False,
         load_sr=22050,
     ):
-        """Get the conditioning latents for the GPT model from the given audio.
+        """
+        Get the conditioning latents for the GPT model from the given audio.
 
         Args:
-            audio_path (str or List[str]): Path to reference audio file(s).
-            max_ref_length (int): Maximum length of each reference audio in seconds. Defaults to 30.
-            gpt_cond_len (int): Length of the audio used for gpt latents. Defaults to 6.
-            gpt_cond_chunk_len (int): Chunk length used for gpt latents. It must be <= gpt_conf_len. Defaults to 6.
-            librosa_trim_db (int, optional): Trim the audio using this value. If None, not trimming. Defaults to None.
-            sound_norm_refs (bool, optional): Whether to normalize the audio. Defaults to False.
-            load_sr (int, optional): Sample rate to load the audio. Defaults to 24000.
+            audio_path (str or List[str], optional): Path to reference audio file(s).
+            audio_tensor (torch.Tensor, optional): Pre-loaded audio tensor [1, T].
+            max_ref_length (int): Maximum length of each reference audio in seconds.
+            gpt_cond_len (int): Length of the audio used for gpt latents.
+            gpt_cond_chunk_len (int): Chunk length used for gpt latents.
+            librosa_trim_db (int, optional): Trim the audio using this value. If None, not trimming.
+            sound_norm_refs (bool): Whether to normalize the audio.
+            load_sr (int): Sample rate to load the audio.
         """
-        # deal with multiples references
+        if audio_tensor is not None:
+            audio = audio_tensor.to(self.device)
+            audio = audio[:, : load_sr * max_ref_length]
+            if sound_norm_refs:
+                audio = (audio / torch.abs(audio).max()) * 0.75
+            if librosa_trim_db is not None:
+                audio = librosa.effects.trim(audio, top_db=librosa_trim_db)[0]
+
+            speaker_embedding = self.get_speaker_embedding(audio, load_sr)
+            gpt_cond_latents = self.get_gpt_cond_latents(
+                audio, load_sr, length=gpt_cond_len, chunk_length=gpt_cond_chunk_len
+            )
+            return gpt_cond_latents, speaker_embedding
+
         if not isinstance(audio_path, list):
             audio_paths = [audio_path]
         else:
@@ -355,7 +489,6 @@ class Xtts(BaseTTS):
 
         speaker_embeddings = []
         audios = []
-        speaker_embedding = None
         for file_path in audio_paths:
             audio = load_audio(file_path, load_sr)
             audio = audio[:, : load_sr * max_ref_length].to(self.device)
@@ -364,25 +497,61 @@ class Xtts(BaseTTS):
             if librosa_trim_db is not None:
                 audio = librosa.effects.trim(audio, top_db=librosa_trim_db)[0]
 
-            # compute latents for the decoder
-            speaker_embedding = self.get_speaker_embedding(audio, load_sr)
-            speaker_embeddings.append(speaker_embedding)
-
+            spk_emb = self.get_speaker_embedding(audio, load_sr)
+            speaker_embeddings.append(spk_emb)
             audios.append(audio)
 
-        # merge all the audios and compute the latents for the gpt
+        # merge and compute GPT latents
         full_audio = torch.cat(audios, dim=-1)
         gpt_cond_latents = self.get_gpt_cond_latents(
             full_audio, load_sr, length=gpt_cond_len, chunk_length=gpt_cond_chunk_len
-        )  # [1, 1024, T]
+        )
 
+        # average speaker embeddings
         if speaker_embeddings:
-            speaker_embedding = torch.stack(speaker_embeddings)
-            speaker_embedding = speaker_embedding.mean(dim=0)
+            speaker_embedding = torch.stack(speaker_embeddings).mean(dim=0)
+        else:
+            speaker_embedding = None
 
         return gpt_cond_latents, speaker_embedding
 
-    def synthesize(self, text, config, speaker_wav, language, speaker_id=None, **kwargs):
+    def get_conditioning_latents_image(
+        self,
+        arcface_input: torch.Tensor,
+        clip_input:    torch.Tensor,
+        gpt_cond_len:  int = 6,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        arc_emb  = self.arcface_encoder(arcface_input) 
+        clip_emb = self.clip_encoder(clip_input)       
+        arc_for_style = arc_emb.detach() if self.style_stopgrad_from_arc else arc_emb
+        fused_512 = self.concat_fusion(arc_for_style, clip_emb)
+        spk_src = arc_emb
+        spk_latent = self.image_spkr_head(spk_src)      # [B, D_spk]
+        if self.training and self.spk_feat_drop_p > 0.0:
+            p = float(self.spk_feat_drop_p)
+            mask = torch.empty_like(spk_latent).bernoulli_(1.0 - p)
+            spk_latent = spk_latent * mask / (1.0 - p)
+        spk_latent = F.normalize(spk_latent, dim=1)
+        speaker_embedding = spk_latent.unsqueeze(-1) 
+
+        style_mel = self.clip_proj(fused_512)     
+        style_mel = self.style_adapter(style_mel)     
+        if self.style_mel_norm:
+            mu  = style_mel.mean(dim=1, keepdim=True)
+            std = style_mel.std(dim=1, keepdim=True).clamp_min(1e-5)
+            style_mel = (style_mel - mu) / std
+
+        T = gpt_cond_len or self.args.gpt_cond_len
+        style_seq = style_mel.unsqueeze(-1).expand(-1, -1, T)  
+        if self.training and self.style_time_jitter_std > 0.0:
+            style_seq = style_seq + torch.randn_like(style_seq) * float(self.style_time_jitter_std)
+
+        cond       = self.gpt.get_style_emb(style_seq, return_latent=False)
+        gpt_latent = cond.transpose(1, 2).contiguous()            
+        return gpt_latent, speaker_embedding
+
+
+    def synthesize(self, text, config, language, image_path, speaker_id=None, **kwargs):
         """Synthesize speech with the given input text.
 
         Args:
@@ -398,6 +567,7 @@ class Xtts(BaseTTS):
             as latents used at inference.
 
         """
+        assert image_path is not None or speaker_id is not None, "You must provide either image_path or speaker_id."
         assert (
             "zh-cn" if language == "zh" else language in self.config.languages
         ), f" ❗ Language {language} is not supported. Supported languages are {self.config.languages}"
@@ -419,13 +589,13 @@ class Xtts(BaseTTS):
             "max_ref_len": config.max_ref_len,
             "sound_norm_refs": config.sound_norm_refs,
         })
-        return self.full_inference(text, speaker_wav, language, **settings)
+        return self.full_inference(text, image_path, language, **settings)
 
     @torch.inference_mode()
     def full_inference(
         self,
         text,
-        ref_audio_path,
+        image_path,
         language,
         # GPT inference
         temperature=0.75,
@@ -481,12 +651,16 @@ class Xtts(BaseTTS):
             Generated audio clip(s) as a torch tensor. Shape 1,S if k=1 else, (k,1,S) where S is the sample length.
             Sample rate is 24kHz.
         """
-        (gpt_cond_latent, speaker_embedding) = self.get_conditioning_latents(
-            audio_path=ref_audio_path,
+        # (gpt_cond_latent, speaker_embedding) = self.get_conditioning_latents(
+        #     audio_path=ref_audio_path,
+        #     gpt_cond_len=gpt_cond_len,
+        #     gpt_cond_chunk_len=gpt_cond_chunk_len,
+        #     max_ref_length=max_ref_len,
+        #     sound_norm_refs=sound_norm_refs,
+        # )
+        (gpt_cond_latent, speaker_embedding) = self.get_conditioning_latents_image(
+            image_path,
             gpt_cond_len=gpt_cond_len,
-            gpt_cond_chunk_len=gpt_cond_chunk_len,
-            max_ref_length=max_ref_len,
-            sound_norm_refs=sound_norm_refs,
         )
 
         return self.inference(
@@ -528,11 +702,33 @@ class Xtts(BaseTTS):
         length_scale = 1.0 / max(speed, 0.05)
         gpt_cond_latent = gpt_cond_latent.to(self.device)
         speaker_embedding = speaker_embedding.to(self.device)
-        dialect_emb = None
-        if hasattr(self, "dialect_embedding") and dialect_id is not None:
-            dialect_emb = self.dialect_embedding(
-                torch.tensor([dialect_id], device=self.device)
-            )
+        B, T, C = gpt_cond_latent.shape
+        if dialect_id is None:
+            raise ValueError("dialect_id must be provided for dialect-conditioned inference")
+
+        dids = torch.full((B,), int(dialect_id), device=self.device, dtype=torch.long)
+
+        style_emb = self.dialect_embedding(dids)            
+        gamma     = self.film_gamma(style_emb).unsqueeze(-1) 
+        beta      = self.film_beta(style_emb).unsqueeze(-1)  
+
+        spk_lat = speaker_embedding.squeeze(-1)             
+        base_logf0 = self.spk_to_logf0(spk_lat).squeeze(-1) 
+        base_logf0 = base_logf0.unsqueeze(1).expand(-1, T) 
+
+        delta_semi = self.dialect_pitch_predictor(dids, T)  
+        delta_semi = torch.clamp(delta_semi, -5.0, 5.0)   
+
+        delta_log = delta_semi * (math.log(2.0) / 12.0)     
+        pred_logf0 = base_logf0 + delta_log   
+        pred_f0    = torch.exp(pred_logf0) 
+
+        pitch_e = self.pitch_embedding(pred_f0).transpose(1, 2) 
+
+        cond_t = gpt_cond_latent.transpose(1, 2)        
+        fused  = gamma * cond_t + beta + pitch_e  
+        gpt_cond_latent = fused.transpose(1, 2).contiguous()
+
         if enable_text_splitting:
             text = split_sentence(text, language, self.tokenizer.char_limits[language])
         else:
@@ -564,21 +760,18 @@ class Xtts(BaseTTS):
                     output_attentions=False,
                     **hf_generate_kwargs,
                 )
+                print("▶ gpt_codes.shape:", gpt_codes.shape)
                 expected_output_len = torch.tensor(
                     [gpt_codes.shape[-1] * self.gpt.code_stride_len], device=text_tokens.device
                 )
 
                 text_len = torch.tensor([text_tokens.shape[-1]], device=self.device)
-                if dialect_emb is None and hasattr(self, "dialect_embedding") and dialect_id is not None:
-                    dialect_emb = self.dialect_embedding(torch.tensor([dialect_id], device=self.device))
-
                 gpt_latents = self.gpt(
                     text_tokens,
                     text_len,
                     gpt_codes,
                     expected_output_len,
                     cond_latents=gpt_cond_latent,
-                    dialect_emb=dialect_emb,
                     return_attentions=False,
                     return_latent=True,
                 )
