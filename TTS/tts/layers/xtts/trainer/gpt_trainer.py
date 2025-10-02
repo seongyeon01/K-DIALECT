@@ -3,6 +3,7 @@ from typing import Dict, List, Tuple, Union
 
 import torch
 import torch.nn as nn
+import random
 import torchaudio
 from coqpit import Coqpit
 from torch.nn import functional as F
@@ -11,15 +12,15 @@ from trainer.torch import DistributedSampler
 from trainer.trainer_utils import get_optimizer, get_scheduler
 import librosa
 import numpy as np
+import math
 
 from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.datasets.dataset import TTSDataset
 from TTS.tts.layers.tortoise.arch_utils import TorchMelSpectrogram
 from TTS.tts.layers.xtts.dvae import DiscreteVAE
 from TTS.tts.layers.xtts.classifier import (
-    load_dialect_classifiers,
-    compute_dialect_adv_loss,
-    compute_contrastive_loss
+    diag_info_nce,
+    orthogonal_loss
 )
 from TTS.tts.layers.xtts.tokenizer import VoiceBpeTokenizer
 from TTS.tts.layers.xtts.trainer.dataset import XTTSDataset
@@ -60,8 +61,20 @@ class GPTArgs(XttsArgs):
     xtts_checkpoint: str = ""
     gpt_checkpoint: str = ""  # if defined it will replace the gpt weights on xtts model
     vocoder: str = ""  # overide vocoder key on the config to avoid json write issues
-    # c_contrast: float = 0.1   # contrastive loss weight
+    c_contrast: float = 0.7   # contrastive loss weight
     c_adv:     float = 0.3   # adversarial loss weight
+    c_spk_distill = 1.0
+    c_mse = 0.5
+    c_mp_nce = 0.5
+    tau = 0.07
+    tau_style = 0.07
+    tau_spk = 0.07
+    c_ortho = 0.05
+    c_arc = 0.5
+    arc_margin = 0.2
+    arc_scale = 30.0
+    mix_ratio = 0.4
+    pitch_loss_weight = 0.3 
 
 
 def callback_clearml_load_save(operation_type, model_info):
@@ -207,21 +220,6 @@ class GPTTrainer(BaseTTS):
         n_model = self.xtts.args.gpt_n_model_channels
         self.dialect_embedding = nn.Embedding(num_embeddings=6, embedding_dim=n_model)
         nn.init.xavier_uniform_(self.dialect_embedding.weight)
-        model_paths = {
-            0: "/data/jupyter/yeon/research/FVTTS_code/new_class/dialect_0.pth",
-            1: "/data/jupyter/yeon/research/FVTTS_code/new_class/dialect_1.pth",
-            2: "/data/jupyter/yeon/research/FVTTS_code/new_class/dialect_2.pth",
-            3: "/data/jupyter/yeon/research/FVTTS_code/new_class/dialect_3.pth",
-            4: "/data/jupyter/yeon/research/FVTTS_code/new_class/dialect_4.pth",
-            5: "/data/jupyter/yeon/research/FVTTS_code/new_class/dialect_5.pth",
-        }
-        self.dialect_classifier = load_dialect_classifiers(
-            model_paths,
-            device=torch.device("cpu"),
-        )
-        for clf in self.dialect_classifier.values():
-            clf.to(self.device)
-
 
     @property
     def device(self):
@@ -266,8 +264,9 @@ class GPTTrainer(BaseTTS):
                 wav = self.xtts.synthesize(
                     s_info["text"],
                     self.config,
-                    s_info["speaker_wav"],
+                    # s_info["speaker_wav"],
                     s_info["language"],
+                    s_info["image_path"],
                     gpt_cond_len=3,
                 )["wav"]
                 test_audios["{}-audio".format(idx)] = wav
@@ -322,67 +321,117 @@ class GPTTrainer(BaseTTS):
         batch["audio_codes"] = codes
         labels = batch["dialect_labels"].to(self.device)
         batch["dialect_emb"] = self.dialect_embedding(labels)  # (B,128)
+        batch["image_emb"] = batch["image_emb"]
+        batch["f0_emb"] = batch["f0_emb"]
         # delete useless batch tensors
         del batch["padded_text"]
-        del batch["wav"]
+        # del batch["wav"]
         del batch["conditioning"]
         return batch
 
     def train_step(self, batch, criterion):
-        dialect_labels = batch["dialect_labels"]  # LongTensor [B]
-        unique, counts = dialect_labels.unique(return_counts=True)
-        loss_dict = {}
-        cond_mels = batch["cond_mels"]
-        text_inputs = batch["text_inputs"]
-        text_lengths = batch["text_lengths"]
-        audio_codes = batch["audio_codes"]
-        wav_lengths = batch["wav_lengths"]
-        cond_idxs = batch["cond_idxs"]
-        cond_lens = batch["cond_lens"]
+        device = self.device
         dialect_labels = batch["dialect_labels"].to(self.device)
+        loss_dict = {}
+
+        # ----- 필수 텐서 -----
+        text_inputs  = batch["text_inputs"]
+        text_lengths = batch["text_lengths"]
+        audio_codes  = batch["audio_codes"]
+        wav_lengths  = batch["wav_lengths"]
+        cond_idxs    = batch["cond_idxs"]
+        cond_lens    = batch["cond_lens"]
+        dialect_lbls = batch["dialect_labels"].to(device)
+
+        with torch.no_grad():
+            a_lat, a_spk_3d = self.xtts.get_conditioning_latents(
+                audio_tensor=batch["wav"],
+                max_ref_length=self.args.max_conditioning_length,
+                gpt_cond_len=12,
+                gpt_cond_chunk_len=4,
+            )
+            a_style = F.normalize(a_lat.mean(dim=2), dim=1)  
+            a_spk   = F.normalize(a_spk_3d.squeeze(-1), dim=1) 
+
+            secs_teacher = F.normalize(self.xtts.secs_encoder(batch["wav"], sr=22050), dim=1)  # [B, secs_dim]
+
+        i_lat, i_spk_3d = self.xtts.get_conditioning_latents_image(
+            batch["image_emb"], clip_input=batch["clip_emb"], gpt_cond_len=12
+        )
+        i_style = F.normalize(i_lat.mean(dim=2), dim=1) 
+        i_spk   = F.normalize(i_spk_3d.squeeze(-1), dim=1) 
+
+        i_spk_proj = F.normalize(self.xtts.secs_align(i_spk), dim=1) 
+
+        loss_contrast = self.args.c_contrast * (
+            diag_info_nce(i_style, a_style, tau=self.args.tau_style) +
+            diag_info_nce(i_spk,   a_spk,   tau=self.args.tau_spk)
+        )
+
+        loss_mse_style   = self.args.c_mse * F.mse_loss(i_style, a_style)
+
+        loss_spk_distill = self.args.c_spk_distill * (
+            1.0 - F.cosine_similarity(i_spk_proj, secs_teacher, dim=1)
+        ).mean()
+
+        loss_ortho = self.args.c_ortho * orthogonal_loss(i_style, i_spk)
+
+        loss_dict.update(
+            loss_contrastive=loss_contrast,
+            loss_mse_style=loss_mse_style,
+            loss_spk_distill=loss_spk_distill,
+            loss_orthogonal=loss_ortho,
+        )
+        cond_lat = a_lat.clone()    
+        speaker_embedding = a_spk        
+                
+        B, T, C = cond_lat.shape
+        style_emb = self.xtts.dialect_embedding(dialect_labels)    
+
+        delta_semi_pred = self.xtts.dialect_pitch_predictor(dialect_labels, T) 
+
+        cond_t = cond_lat.transpose(1, 2)  
+        gamma  = self.xtts.film_gamma(style_emb).unsqueeze(-1) 
+        beta   = self.xtts.film_beta(style_emb).unsqueeze(-1)  
+
+        pitch_emb = self.xtts.pitch_embedding(delta_semi_pred).transpose(1, 2)  # [B, C, T]
+        fused = gamma * cond_t + beta + pitch_emb
+        cond_mels = fused.transpose(1, 2)  
+
+        gt_f0 = batch["f0_emb"].to(self.device) 
+        T_gt = min(delta_semi_pred.size(1), gt_f0.size(1))
+
+
+        gt_logf0 = torch.log(gt_f0[:, :T_gt].clamp(min=1e-6)) 
+
+        with torch.no_grad():
+            spk_lat = speaker_embedding.squeeze(-1)           
+            base_logf0 = self.xtts.spk_to_logf0(spk_lat).squeeze(-1)  
+        base_logf0 = base_logf0.unsqueeze(1).expand(-1, T_gt)  
+
+        cond_mels = i_lat if (random.random() < float(self.args.mix_ratio)) else a_lat
+        delta_logf0 = gt_logf0 - base_logf0
+        delta_semi_gt = delta_logf0 * (12.0 / math.log(2.0))
+        loss_pitch = F.mse_loss(delta_semi_pred[:, :T_gt], delta_semi_gt)
+        loss_dict["loss_pitch"] = loss_pitch * self.args.pitch_loss_weight
+
+
         loss_text, loss_mel, mel_logits = self.forward(
-            text_inputs, text_lengths, audio_codes, wav_lengths, cond_mels, cond_idxs, cond_lens, dialect_labels,
+            text_inputs, text_lengths, audio_codes, wav_lengths,
+            cond_mels, cond_idxs, cond_lens, dialect_lbls
         )
         loss_dict["loss_text_ce"] = loss_text * self.args.gpt_loss_text_ce_weight
-        loss_dict["loss_mel_ce"] = loss_mel * self.args.gpt_loss_mel_ce_weight
-                
-        # Decode logits
-        mel_ids = mel_logits.argmax(dim=1)
+        loss_dict["loss_mel_ce"]  = loss_mel   * self.args.gpt_loss_mel_ce_weight
 
-        # 1. Mel-id → GPT latent
-        with torch.no_grad():
-            gpt_latent = self.xtts.gpt(
-                text_inputs,
-                text_lengths,
-                mel_ids,
-                wav_lengths,
-                cond_mels=cond_mels,
-                dialect_emb=self.dialect_embedding(dialect_labels),
-                cond_idxs=cond_idxs,
-                cond_lens=cond_lens,
-                return_latent=True,
-            )
-            speaker_embedding = torch.zeros(
-                (gpt_latent.size(0), self.config.d_vector_dim, 1), device=self.device
-            )
-            wav_recon = self.xtts.hifigan_decoder(gpt_latent, g=speaker_embedding)  # (B, 1, T)
+        total = (
+            loss_dict["loss_text_ce"] + loss_dict["loss_mel_ce"]
+        + loss_dict["loss_contrastive"] + loss_dict["loss_mse_style"]
+        + loss_dict["loss_spk_distill"] + loss_dict["loss_orthogonal"] + loss_dict["loss_pitch"]
+        )
+        loss_dict["loss"] = total
 
-        # 2. Wav → MFCC (torch → numpy → librosa → torch)
-        mfccs = []
-        for wav in wav_recon:
-            wav_np = wav.squeeze().detach().cpu().numpy()
-            mfcc = librosa.feature.mfcc(y=wav_np, sr=22050, n_mfcc=128)
-            mfcc = np.pad(mfcc, ((0, 0), (0, max(0, 128 - mfcc.shape[1]))), mode="constant")[:, :128]
-            mfcc_tensor = torch.from_numpy(mfcc).float().unsqueeze(0).unsqueeze(0)
-            mfccs.append(mfcc_tensor)
-        mfcc_batch = torch.cat(mfccs, dim=0).to(self.device)  # (B, 1, 128, 128)
-
-        # 3. Classifier loss
-        adv_loss = compute_dialect_adv_loss(mfcc_batch, self.dialect_classifier, dialect_labels) * self.args.c_adv
-        loss_dict["loss_adv"] = adv_loss
-
-        loss_dict["loss"] = loss_dict["loss_text_ce"] + loss_dict["loss_mel_ce"] + loss_dict["loss_adv"]
         return {"model_outputs": None}, loss_dict
+
 
     def eval_step(self, batch, criterion):
         # ignore masking for more consistent evaluation
@@ -511,6 +560,14 @@ class GPTTrainer(BaseTTS):
             params_names_weights = sorted(list(all_param_names ^ param_names_notweights))
             params_weights = [param_map[k] for k in params_names_weights]
             params_weights += [self.dialect_embedding.weight]
+            params_weights += list(self.xtts.arcface_encoder.projection.parameters())
+            params_weights += list(self.xtts.clip_encoder.projection.parameters())
+            params_weights += list(self.xtts.image_spkr_proj.parameters())
+            params_weights += list(self.xtts.clip_proj.parameters())
+            params_weights += list(self.xtts.style_adapter.parameters())
+            params_weights += list(self.xtts.concat_fusion.parameters())
+            params_weights += list(self.xtts.image_spkr_head.parameters())
+            params_weights += list(self.xtts.secs_align.parameters())
             groups = [
                 {"params": params_weights, "weight_decay": self.config.optimizer_params["weight_decay"]},
                 {"params": params_notweights, "weight_decay": 0},
