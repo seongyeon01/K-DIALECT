@@ -27,7 +27,7 @@ GRAD_ACUMM_STEPS = 84  # set here the grad accumulation steps
 config_dataset = BaseDatasetConfig(
     formatter="coqui",
     dataset_name="data_22050",
-    path="/data/jupyter/yeon/TTS/data_22050/",
+    path="/data/jupyter/TTS/data_22050/",
     meta_file_train="metadata3.csv",
     language="ko",
 )
@@ -72,7 +72,7 @@ if not os.path.isfile(TOKENIZER_FILE) or not os.path.isfile(XTTS_CHECKPOINT):
 
 # Training sentences generations
 SPEAKER_REFERENCE = [
-    "/data/jupyter/yeon/research/FVTTS_code/data2/Chungcheong_valid_mono/DCDG20000116_1_wav1.wav"  # speaker reference to be used in training test sentences
+    "/data/jupyter/research/DCDG20000116_1_wav1.wav"  # speaker reference to be used in training test sentences
 ]
 LANGUAGE = config_dataset.language
 
